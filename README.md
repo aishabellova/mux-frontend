@@ -135,60 +135,6 @@ cross-network or fabricated data.
 **Production defaults:** when `NODE_ENV=production`, unset vars with a
 documented default (e.g. `NEXT_PUBLIC_MUX_API_URL` →
 `https://api.muxprotocol.com`) are applied automatically by `getEnv()`,
-so a production deploy with a forgotten env var talks to the real
-backend instead of silently serving mock data. Local dev and tests are
-unaffected — leaving everything unset there still uses the in-repo
-mocks.
+so a production dep
 
-`NODE_ENV` (standard Next.js variable, not defined in `.env.example`)
-also gates some behavior: analytics/tracking hooks
-(`useAnalytics.ts`, `useAnalyticsMetrics.ts`, `useAnalyticsTracking.ts`,
-`recoveryAnalyticsTracking.ts`, `spendingLimitsTracking.ts`) log to the
-console outside of `production`; `src/lib/env.ts` throws on missing
-*required* vars only when `NODE_ENV=production`; and the mock/demo
-fallbacks in API routes and data hooks
-(`src/lib/api/runtimeMode.ts`, `useNotifications.ts`, `useRecovery.ts`)
-are disabled when `NODE_ENV=production` so mock data is never served in a
-production build.
-
-**Production never silently falls back to mock data.** `/api/auth/login`,
-`/api/auth/refresh`, `/api/wallets`, `/api/wallets/[id]`,
-`GET /api/transactions`, `/api/notifications`, `/api/overview`, and
-`/api/api-keys` (`GET`/`POST`/`PATCH`) all fall back to in-repo mock data
-(fake wallets, dashboard stats, API keys, a hardcoded mock bearer/refresh
-token) when no backend URL is configured — that's what makes
-`pnpm run dev`, CI, and the `/demo` routes work with no live backend. In a
-production build (`NODE_ENV=production`) that fallback is disabled: if
-`NEXT_PUBLIC_API_URL` (or its aliases) is missing, those routes return
-`503 backend_unavailable` instead of serving fabricated wallets/analytics/
-API keys or accepting the mock token as valid auth. See
-`isMockFallbackAllowed()` in `src/lib/api/config.ts`.
-
-`APIKeyModal`'s standalone (no-`onCreateKey`) key generator follows the
-same rule client-side, and the wallets sidebar prefetch
-(`src/lib/walletsPrefetchCache.ts`) attaches the caller's session token and
-keys its cache entry by it, so a prefetch from one session is never served
-to a different session that signs in afterward on the same device.
-
-See [`docs/frontend-env-vars.md`](docs/frontend-env-vars.md) for the full
-reference, including which file reads each variable and a manual
-verification checklist.
-
-### Auth and API client behavior
-
-* `src/lib/api.js` adds request header support with `x-request-id` and automatic session refresh on `401`
-* `src/utils/fetchWithAuth.ts` (used by `useWallets` / `useWallet` / the Send flow) mirrors that
-  behaviour: on a `401` it calls `POST /api/auth/refresh` once and retries the original request with the
-  r
-
-frontend-env-vars.md`](docs/frontend-env-vars.md) for the full
-reference, including which file reads each variable and a manual
-verification checklist.
-
-### Auth and API client behavior
-
-* `src/lib/api.js` adds request header support with `x-request-id` and automatic session refresh on `401`
-* `src/utils/fetchWithAuth.ts` (used by `useWallets` / `useWallet` / the Send flow) mirrors that
-  behaviour: on a `401` it calls `POST /api/auth/refresh` once and retries the original request with the
-  r
-
+/* … truncated 2968 chars — edit only what you need near the top … */

@@ -8,6 +8,26 @@ or replace the auth layer when a real backend is available.
 
 ---
 
+## Auth invariants
+
+These hold in every environment and must not be weakened by local setup
+changes:
+
+- **Fail-closed authz.** A protected route requires a server-verified session.
+  If the backend session check fails, times out, or is unreachable, access is
+  denied — never granted by falling back to a client-set marker cookie.
+- **Deny-by-default for privileged surfaces.** New privileged routes/entrypoints
+  are gated by `PROTECTED_PREFIXES` (or an equivalent explicit allow-list) and
+  are unreachable until added deliberately.
+- **No secrets in logs or the repo.** Never log or commit JWTs, access/refresh
+  tokens, `mux_auth_token` values, webhook secrets, or raw key material. Redact
+  them in any diagnostic output.
+- **Server is the source of truth** for spends, recovery, and admin actions.
+  The client only reflects server decisions; it never authorizes money-path or
+  admin operations on its own.
+
+---
+
 ## Overview
 
 The Mux Protocol frontend uses a **hybrid session** model:
@@ -157,11 +177,11 @@ What `signIn` does:
    (`sessionStorage`) so `src/lib/api.js` can authorize requests (#628).
 4. Updates `user` state in `AuthContext` → `isAuthenticated` becomes `true`.
 
-The authoritative session token — the `HttpOnly` `mux_auth_session` cookie
-the middleware verifies in production — is set by `POST /api/auth/login`
-server-side, not by `signIn`. The browser keeps the `HttpOnly` value; the
-client-side marker write is ignored when an `HttpOnly` cookie of the same
-name already exists.
+The authoritative session token — the `HttpOnly` `mux_auth_token` cookie
+set by `POST /api/auth/login` server-side — is what the middleware verifies
+in backend mode. The browser keeps the `HttpOnly` value; the client-side
+`mux_auth_session` marker write is ignored when an `HttpOnly` cookie of the
+same name already exists, and is never trusted on its own.
 
 ### Sign out (`signOut`)
 
@@ -212,106 +232,6 @@ export const PROTECTED_PREFIXES = ["/dashboard", "/demo/dashboard"];
 developer console must never be publicly reachable with mock wallets and
 fake analytics in a production build.
 
-Add new protected route prefixes to `PROTECTED_PREFIXES` in
-`src/lib/auth/routeAccess.ts` **and** to the `config.matcher` list at the
-bottom of `src/middleware.ts` as the app grows.
+Add
 
-`DashboardLayout` wraps its children in `AuthGuard` for the real
-`/dashboard/*` tree (`requireAuth` defaults to `true`; the demo tree passes
-`requireAuth={false}`). `AuthGuard` shows a skeleton while the session
-rehydrates and redirects to `/login` if there is no in-memory session.
-
-`useSessionGuard()` can also be used at the top of any protected page to
-handle the case where the middleware cookie passes but the in-memory session
-is stale:
-
-```ts
-"use client";
-import { useSessionGuard } from "@/hooks/useSessionGuard";
-
-export default function DashboardPage() {
-  useSessionGuard(); // redirects to "/" if not authenticated
-  return <div>...</div>;
-}
-```
-
----
-
-## Replacing the Stub with a Real API
-
-When a backend auth endpoint is available, replace the `authenticateUser`
-function in `src/app/login/page.tsx`:
-
-```ts
-// Before (stub):
-async function authenticateUser(email: string, _password: string) {
-  await new Promise((r) => setTimeout(r, 400));
-  return { name: "...", email, role: "developer" };
-}
-
-// After (real API):
-async function authenticateUser(email: string, password: string) {
-  const res = await fetch("/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!res.ok) throw new Error("Invalid credentials");
-  return res.json(); // { name, email, role }
-}
-```
-
-The rest of the login page (validation, error handling, redirect) requires
-no changes.
-
----
-
-## Environment Variables
-
-No environment variables are required for local development in mock mode.
-To run against a real backend (which also enables server-verified sessions,
-#621), set the API base URL in `.env.local`:
-
-```env
-# Base URL for the Mux backend API. When set, /api/auth/login proxies to
-# {NEXT_PUBLIC_API_URL}/auth/login and the middleware verifies sessions via
-# {NEXT_PUBLIC_API_URL}/auth/session on every protected request.
-NEXT_PUBLIC_API_URL=http://localhost:4000
-```
-
-The backend is expected to expose `POST /auth/login` (returning a user plus
-an opaque session `token` / `accessToken` / `sessionToken`),
-`POST /auth/refresh` (rotating the token), `GET /auth/session` (200 when the
-token is valid), and `POST /auth/logout`. No custody secrets are ever placed
-in `NEXT_PUBLIC_*` or `localStorage`; the session token lives only in an
-HttpOnly cookie (bearer tokens, when returned, live only in tab-scoped
-`sessionStorage`).
-
----
-
-## Testing
-
-Tests for the login page and auth context live in:
-
-```
-src/app/login/__tests__/LoginPage.test.tsx
-src/context/__tests__/AuthContext.test.ts
-src/lib/auth/__tests__/sessionToken.test.ts   # JWT sign/verify (#622)
-src/lib/auth/__tests__/routeAccess.test.ts     # access-decision logic (#621)
-src/__tests__/middleware.test.ts               # route protection + callbackUrl (#652)
-src/app/api/auth/login/__tests__/route.test.ts # sets the session cookie
-src/app/api/auth/logout/route.test.ts          # clears the session cookie
-src/components/layouts/__tests__/AuthGuard.test.tsx
-src/components/layouts/__tests__/DashboardLayout.test.tsx  # AuthGuard wiring (#623)
-```
-
-Run tests with:
-
-```bash
-npm test
-# or
-pnpm test
-```
-
-See `src/app/login/__tests__/LoginPage.test.tsx` for examples of how to test
-the login form, validation, and redirect behaviour.
+/* … truncated 3467 chars — edit only what you need near the top … */
