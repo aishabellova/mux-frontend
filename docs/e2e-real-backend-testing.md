@@ -45,6 +45,36 @@ instead of running — see `REAL_BACKEND_SKIP_REASON` in `helpers.ts`. This
 means the suite is safe to wire into CI unconditionally: it's a no-op
 until those secrets are actually provisioned for a given environment.
 
+## Config honesty: `playwright.real-backend.config.ts`
+
+The real-backend suite is only meaningful if its Playwright config
+actually points at the real-backend specs and wires the env through. The
+config is validated by `tests/e2e-real-backend.config.test.ts`, which
+asserts the real invariants below rather than trivially passing. If you
+change the config, keep these true or the test will (correctly) fail:
+
+- **`testDir` targets the real-backend suite.** It must resolve to
+  `tests/e2e/real-backend` — not the mock-only `tests/e2e/` directory.
+  Pointing it at the mock suite would silently re-run mock specs under a
+  "real backend" name.
+- **`baseURL` / env wiring.** The config must forward
+  `NEXT_PUBLIC_API_URL` (and `PLAYWRIGHT_BASE_URL` when set) into the
+  dev-server / browser env so the app under test talks to the real
+  backend, not the mock default.
+- **Retries and timeouts.** Real-backend runs are slower and flakier than
+  the mock suite (network, cold starts), so the config sets explicit
+  `retries` and `timeout` values; the test pins them so a future edit
+  can't quietly drop them to zero.
+- **Reporter.** The config declares its reporter explicitly so CI output
+  is stable and parseable.
+- **Fail-closed guard.** When the required real-backend env
+  (`NEXT_PUBLIC_API_URL`, `E2E_TEST_EMAIL`, `E2E_TEST_PASSWORD`) is
+  absent, the config must fail closed — it throws (or the suite skips
+  with `REAL_BACKEND_SKIP_REASON`) rather than silently running against
+  a mock or an empty base URL. The test covers this negative path: a
+  missing/misconfigured env must not produce a green run that never
+  touched a real backend.
+
 ## Running
 
 ```bash

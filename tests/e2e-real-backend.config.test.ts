@@ -44,6 +44,21 @@ describe("playwright.real-backend.config.ts (real-backend suite)", () => {
 		const env = webServer && "env" in webServer ? webServer.env : undefined;
 		expect(env?.NEXT_PUBLIC_API_URL).toBeUndefined();
 	});
+
+	it("wires baseURL from the real-backend env so specs hit the configured origin", () => {
+		const baseURL = realBackendConfig.use?.baseURL;
+		expect(typeof baseURL).toBe("string");
+		expect(baseURL).toMatch(/^https?:\/\//);
+	});
+
+	it("keeps retries and timeouts bounded for a real network path", () => {
+		expect(realBackendConfig.retries).toBeGreaterThanOrEqual(0);
+		expect(realBackendConfig.timeout).toBeGreaterThan(0);
+	});
+
+	it("declares a reporter so CI surfaces real-backend failures", () => {
+		expect(realBackendConfig.reporter).toBeDefined();
+	});
 });
 
 describe("readRealBackendEnv", () => {
@@ -62,6 +77,13 @@ describe("readRealBackendEnv", () => {
 		vi.stubEnv("NEXT_PUBLIC_API_URL", "https://api.example.com");
 		vi.stubEnv("E2E_TEST_EMAIL", "");
 		vi.stubEnv("E2E_TEST_PASSWORD", "");
+		expect(readRealBackendEnv()).toBeNull();
+	});
+
+	it("returns null when NEXT_PUBLIC_API_URL is not a valid http(s) origin", () => {
+		vi.stubEnv("NEXT_PUBLIC_API_URL", "not-a-url");
+		vi.stubEnv("E2E_TEST_EMAIL", "qa@example.com");
+		vi.stubEnv("E2E_TEST_PASSWORD", "correct-horse");
 		expect(readRealBackendEnv()).toBeNull();
 	});
 

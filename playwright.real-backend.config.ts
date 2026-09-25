@@ -28,6 +28,33 @@ import { defineConfig, devices } from "@playwright/test";
  *   NEXT_PUBLIC_API_URL=... E2E_TEST_EMAIL=... E2E_TEST_PASSWORD=... \
  *   pnpm exec playwright test --config=playwright.real-backend.config.ts
  */
+
+/**
+ * Fail-closed guard: this config exists to exercise a REAL backend, so a
+ * missing NEXT_PUBLIC_API_URL is a misconfiguration, not a reason to
+ * silently fall back to the in-repo mock. Throwing here makes the whole
+ * run fail loudly (and is asserted by
+ * tests/e2e-real-backend.config.test.ts) instead of producing a green
+ * run that never touched a real backend.
+ *
+ * Set E2E_REAL_BACKEND_ALLOW_MISSING_API_URL=1 to opt out (e.g. when
+ * merely collecting/listing specs in CI without a backend available).
+ */
+function assertRealBackendConfigured(): void {
+	if (process.env.E2E_REAL_BACKEND_ALLOW_MISSING_API_URL === "1") {
+		return;
+	}
+	const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+	if (!apiUrl || apiUrl.trim() === "") {
+		throw new Error(
+			"playwright.real-backend.config.ts requires NEXT_PUBLIC_API_URL to point at a real mux-backend (fail-closed). " +
+				"Set NEXT_PUBLIC_API_URL, or set E2E_REAL_BACKEND_ALLOW_MISSING_API_URL=1 to explicitly opt out.",
+		);
+	}
+}
+
+assertRealBackendConfigured();
+
 export default defineConfig({
 	testDir: "./tests/e2e/real-backend",
 	fullyParallel: false,
