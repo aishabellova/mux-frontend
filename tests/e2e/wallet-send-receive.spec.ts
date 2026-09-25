@@ -9,9 +9,14 @@ import { expect, test } from "@playwright/test";
  *
  * - the receive QR code being a real, scannable image (not a stub) with a
  *   working file download
+ * - the receive dialog showing an unambiguous network badge derived from
+ *   the wallet's configured network, and failing closed (never silently
+ *   defaulting to mainnet) when the network is unknown/misconfigured
  * - the send form actually submitting to the real `/api/transactions`
  *   route handler (mock-backed in this environment) instead of just
  *   closing the modal with no request
+ * - the send form rejecting malformed/unsupported recipient strkeys
+ *   client-side (fail-closed) before any request reaches the backend
  */
 
 const FUNDED_WALLET = {
@@ -23,12 +28,15 @@ const FUNDED_WALLET = {
 	balance: "1,250.50 XLM",
 };
 
-async function stubWallets(page: import("@playwright/test").Page) {
+async function stubWallets(
+	page: import("@playwright/test").Page,
+	wallet: Record<string, unknown> = FUNDED_WALLET,
+) {
 	await page.route("**/api/wallets", (route) =>
 		route.fulfill({
 			status: 200,
 			contentType: "application/json",
-			body: JSON.stringify([FUNDED_WALLET]),
+			body: JSON.stringify([wallet]),
 		}),
 	);
 }
@@ -64,6 +72,57 @@ test.describe("Wallet send/receive smoke", () => {
 		);
 	});
 
+	test("shows a mainnet network badge for a mainnet wallet", async ({
+		page,
+	}) => {
+		await stubWallets(page);
+		await page.goto("/wallet");
+
+		await page.getByRole("button", { name: "Receive funds" }).click();
+
+		const dialog = page.getByRole("dialog");
+		await expect(dialog).toBeVisible();
+
+		const badge = dialog.getByTestId("network-badge");
+		await expect(badge).toBeVisible();
+		await expect(badge).toHaveText(/mainnet/i);
+		await expect(badge).toHaveAttribute("data-network", "mainnet");
+	});
+
+	test("shows a testnet network badge for a testnet wallet", async ({
+		page,
+	}) => {
+		await stubWallets(page, { ...FUNDED_WALLET, network: "testnet" });
+		await page.goto("/wallet");
+
+		await page.getByRole("button", { name: "Receive funds" }).click();
+
+		const dialog = page.getByRole("dialog");
+		await expect(dialog).toBeVisible();
+
+		const badge = dialog.getByTestId("network-badge");
+		await expect(badge).toBeVisible();
+		await expect(badge).toHaveText(/testnet/i);
+		await expect(badge).toHaveAttribute("data-network", "testnet");
+	});
+
+	test("fails closed with an unknown network badge instead of defaulting to mainnet", async ({
+		page,
+	}) => {
+		await stubWallets(page, { ...FUNDED_WALLET, network: "futurenet" });
+		await page.goto("/wallet");
+
+		await page.getByRole("button", { name: "Receive funds" }).click();
+
+		const dialog = page.getByRole("dialog");
+		await expect(dialog).toBeVisible();
+
+		const badge = dialog.getByTestId("network-badge");
+		await expect(badge).toBeVisible();
+		await expect(badge).toHaveAttribute("data-network", "unknown");
+		await expect(badge).not.toHaveText(/mainnet/i);
+	});
+
 	test("submits a send transaction to the real transactions API", async ({
 		page,
 	}) => {
@@ -91,5 +150,74 @@ test.describe("Wallet send/receive smoke", () => {
 		expect(response.status()).toBe(201);
 
 		await expect(dialog).not.toBeVisible();
+	});
+
+	test("blocks submission and shows an error for a malformed recipient strkey", async ({
+		page,
+	}) => {
+		await stubWallets(page);
+		await page.goto("/wallet");
+
+		await page.getByRole("button", { name: "Send funds" }).click();
+
+		const dialog = page.getByRole("dialog");
+		await expect(dialog).toBeVisible();
+
+		let transactionRequested = false;
+		await page.route("**/api/transactions", (route) => {
+			transactionRequested = true;
+			return route.fulfill({
+				status: 201,
+				contentType: "application/json",
+				body: JSON.stringify({ id: "tx-should-not-happen" }),
+			});
+		});
+
+		await page
+			.getByLabel("Destination address")
+			.fill("not-a-valid-strkey");
+		await page.getByLabel("Amount (XLM)").fill("25");
+		await page.getByRole("button", { name: "Submit send transaction" }).click();
+
+		await expect(dialog).toBeVisible();
+		await expect(
+			dialog.getByText(/invalid.*(address|strkey)/i),
+		).toBeVisible();
+		expect(transactionRequested).toBe(false);
+	});
+
+	test("blocks submission for a strkey with an unsupported prefix", async ({
+		page,
+	}) => {
+		await stubWallets(page);
+		await page.goto("/wallet");
+
+		await page.getByRole("button", { name: "Send funds" }).click();
+
+		const dialog = page.getByRole("dialog");
+		await expect(dialog).toBeVisible();
+
+		let transactionRequested = false;
+		await page.route("**/api/transactions", (route) => {
+			transactionRequested = true;
+			return route.fulfill({
+				status: 201,
+				contentType: "application/json",
+				body: JSON.stringify({ id: "tx-should-not-happen" }),
+			});
+		});
+
+		// Valid checksum but a non-account (contract) strkey prefix.
+		await page
+			.getByLabel("Destination address")
+			.fill("CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE");
+		await page.getByLabel("Amount (XLM)").fill("25");
+		await page.getByRole("button", { name: "Submit send transaction" }).click();
+
+		await expect(dialog).toBeVisible();
+		await expect(
+			dialog.getByText(/invalid.*(address|strkey)/i),
+		).toBeVisible();
+		expect(transactionRequested).toBe(false);
 	});
 });

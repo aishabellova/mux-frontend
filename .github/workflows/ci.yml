@@ -40,12 +40,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Runs `tsc --noEmit` against the same tsconfig.json used by `next
-      # build` (via the `next` compiler plugin), so a type error here is
-      # guaranteed to also fail the build step below. This job intentionally
-      # runs before build/test so type errors fail fast.
+      # Husky hooks are a local contributor convenience only. CI must never
+      # depend on them, and a fresh clone without husky installed must not
+      # fail. `HUSKY=0` disables hook installation so `prepare` is a no-op
+      # even if husky is missing or misconfigured.
       - name: Typecheck
         run: pnpm run typecheck
+        env:
+          HUSKY: "0"
 
   unit-tests:
     name: Unit tests (Vitest)
@@ -64,6 +66,8 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          HUSKY: "0"
 
       - name: Run unit/component tests
         run: pnpm test
@@ -85,6 +89,8 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          HUSKY: "0"
 
       # The specs drive a `pnpm run dev` server (see playwright.config.ts) and
       # only need Chromium. `--with-deps` pulls the OS libraries the browser
@@ -132,6 +138,8 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          HUSKY: "0"
 
       - name: Build
         run: pnpm run build
