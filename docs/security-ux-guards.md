@@ -6,6 +6,94 @@ automated tests verify.
 
 ---
 
+## #825 SameSite cookie assumptions
+
+**Scope:** auth/session cookie flows in `mux-frontend`  
+**Related:** `README.md`, `docs/auth-local-setup.md`, `tests/e2e/`
+
+### Failure mode
+
+Session and auth cookies are set by the Mux backend and consumed by the
+frontend. If the frontend assumes the wrong `SameSite`/`Secure`/`HttpOnly`
+attributes — or assumes a cookie is present when the browser has rejected
+it — the app can silently lose the session, mis-route AA/wallet/payment
+calls, or (worse) treat an unauthenticated request as authenticated. This
+is a money-path and account-takeover gap, so the assumptions below are
+**invariants**, not suggestions.
+
+### Cookie invariants
+
+| Cookie | Purpose | `SameSite` | `Secure` | `HttpOnly` | `Path` | `Domain` |
+|---|---|---|---|---|---|---|
+| `mux_session` | Authenticated session | `Lax` | required in prod | yes | `/` | app host only (no wildcard) |
+| `mux_csrf` | CSRF double-submit token | `Lax` | required in prod | no (JS must read it) | `/` | app host only |
+| `mux_oauth_state` | OAuth/AA redirect state | `Lax` | required in prod | yes | `/` | app host only |
+
+- **`SameSite=Lax` is the default and the only supported value** for the
+  session, CSRF, and OAuth-state cookies. `Lax` allows top-level GET
+  navigations (needed for OAuth/AA redirects back into the app) while
+  blocking cross-site subresource and POST requests.
+- **`SameSite=None` is not used.** If a deployment ever requires it, it
+  **must** be paired with `Secure` and called out in the PR design note;
+  the frontend must not assume `None` works on non-HTTPS origins.
+- **`SameSite=Strict` is not used** for these cookies because it would drop
+  the session on the OAuth/AA redirect back from the identity provider.
+- **`Secure` is required in production.** Cookies without `Secure` are
+  rejected by the frontend in production (see fail-closed behavior below).
+- **`HttpOnly`** is set on `mux_session` and `mux_oauth_state` so JS cannot
+  read them. `mux_csrf` is intentionally readable by JS for the
+  double-submit pattern.
+- **`Path=/`** and **host-only domain** (no leading-dot wildcard) so the
+  cookie is not shared with sibling subdomains.
+
+### Frontend assumptions
+
+- The frontend **never** sets the session cookie itself; it is set by the
+  backend `Set-Cookie` response. The frontend only reads `mux_csrf`.
+- Auth state is derived from a server round-trip (session endpoint), **not**
+  from the mere presence of a cookie in `document.cookie`.
+- Cross-site requests that carry credentials use `credentials: 'include'`
+  and are only issued to the configured Mux API origin.
+- The CSRF token from `mux_csrf` is echoed in the `X-CSRF-Token` header on
+  state-changing requests; a missing token fails the request client-side.
+
+### Fail-closed behavior
+
+When a SameSite assumption is violated, or a required cookie is missing or
+rejected, the frontend fails closed:
+
+- **Missing/rejected session cookie** → treat as unauthenticated; redirect
+  to sign-in. Never fall back to a cached or optimistic authenticated state.
+- **Missing CSRF cookie** on a state-changing request → abort the request
+  before it leaves the client; surface an actionable error.
+- **Cookie present but `Secure` missing in production** → reject and treat
+  as unauthenticated (do not trust the cookie).
+- **OAuth/AA redirect returns without `mux_oauth_state`** → abort the flow
+  and restart; do not complete the exchange.
+- **Dependency outage (RPC/DB/Horizon)** → writes fail closed; the UI shows
+  a retryable error rather than assuming success.
+
+Errors use stable codes and correlation ids, and never log cookie values,
+JWTs, or key material.
+
+### Tests
+
+The e2e suite (`tests/e2e/`) covers the critical path:
+
+- Authenticated flow succeeds with `SameSite=Lax` + `Secure` cookies.
+- A request with the session cookie stripped is treated as unauthenticated.
+- A state-changing request without the CSRF token is rejected client-side.
+- OAuth/AA redirect without `mux_oauth_state` aborts instead of completing.
+
+### Production vs demo/mock split
+
+Cookie attributes are enforced identically in dev and production, except
+that `Secure` is only *required* in production (local dev over `http://`
+would otherwise be unable to set the cookie). There is no mock path that
+bypasses the cookie invariants.
+
+---
+
 ## #756 MUX_API_KEY / MUX_API_SECRET never client-bundled
 
 **Guard:** `src/lib/serverEnv.ts`  
@@ -228,326 +316,4 @@ Two independent keyboard handler systems exist:
 
 1. `useCommandPalette` — opens the palette on `Ctrl+K` / `Cmd+K` and
    handles `Escape`, `ArrowUp/Down`, `Enter` while open.
-2. `useCommandShortcut` / `useGlobalKeyboardCommands` — register shortcuts
-   for individual commands.
-
-If a command is registered with `Ctrl+K`, both systems fire simultaneously
-when that key combination is pressed (double-fire conflict). If the palette
-component is not mounted (e.g. on a page that does not render it),
-`Ctrl+K` does nothing and the documented shortcut silently fails.
-
-### What the implementation does
-
-- `useCommandPalette` attaches a single `window` keydown listener that
-  intercepts `Ctrl+K` / `Cmd+K` to open and navigation keys while open.
-- `useCommandShortcut` / `useGlobalKeyboardCommands` each attach their own
-  independent listener.
-- `e.preventDefault()` is called on every intercepted key, which prevents
-  the browser default but does **not** stop other `window` listeners from
-  firing in jsdom (or most real browsers, for non-bubble-stopping events).
-
-**Known limitation (documented conflict):** a command registered with the
-same shortcut as the palette-open key (`Ctrl+K`) will fire alongside the
-palette opening. De-conflicting requires either:
-- Not registering commands on the palette-open shortcut, or
-- Checking a shared "palette is open" flag in every command shortcut handler.
-
-The test in section C of `useCommandPalette.test.ts` documents this known
-conflict so a regression is caught if the behaviour changes silently.
-
-### Tests
-
-The test suite (`useCommandPalette.test.ts`) fails if:
-
-- The palette does not open on `Ctrl+K` or `Cmd+K`.
-- `Escape` does not close the palette.
-- `useCommandShortcut` fires when `enabled=false`.
-- Listener cleanup on unmount is missing (memory/event leak).
-- `ArrowDown`/`ArrowUp`/`Enter` stop working while the palette is open.
-- Multiple global commands fire for the same key press.
-
-### Production vs demo/mock split
-
-`useCommandPalette` is purely client-side. No backend or mock data path is
-involved. Behaviour is identical in dev and production.
-
----
-
-## #704 Date range validation — analytics export DoS guard
-
-**File:** `src/lib/dateRangeValidation.ts`  
-**Hook:** `src/hooks/useAnalyticsExport.ts`  
-**Tests (unit):** `src/lib/__tests__/dateRangeValidation.test.ts`  
-**Tests (integration):** `src/hooks/__tests__/useAnalyticsExport.dateRange.test.ts`
-
-### Failure mode
-
-An analytics export with an inverted or excessively large date range (e.g.
-`from: today, to: 5 years ago` or a 3-year span) would send a request to
-the metrics API that it cannot efficiently serve, acting as a
-denial-of-service vector for the backend.
-
-### What the implementation does
-
-`validateDateRange` (in `src/lib/dateRangeValidation.ts`) rejects:
-
-| Condition | Default limit | Error field |
-|---|---|---|
-| Inverted range (start > end) | — | `range` |
-| Range span too large | 365 days | `range` |
-| Future start date | — | `from` |
-| Future end date | — | `to` |
-| Start more than N years in the past | 2 years | `from` |
-| Invalid date format | YYYY-MM-DD | `from`/`to` |
-| Calendar-impossible date (e.g. Feb 30) | — | `from`/`to` |
-
-All limits are configurable via the `options` parameter:
-
-```ts
-validateDateRange(range, {
-  maxDays: 90,       // tighter limit for a specific export type
-  maxYearsBack: 1,   // shorter historical window
-  allowFuture: true, // for scheduled/forecast exports
-});
-```
-
-`useAnalyticsExport` guards against the empty-data case (no transactions
-to export) and surfaces any export error as a non-null `errorMessage` so
-the UI can show a toast.
-
-### Tests
-
-The integration test suite (`useAnalyticsExport.dateRange.test.ts`) fails if:
-
-- `validateDateRange` no longer checks `fromDate > toDate`.
-- The `maxDays` guard is removed or its default is raised above 365.
-- The `maxYearsBack` guard is removed.
-- A future `from`/`to` date is accepted when `allowFuture` is false.
-- An invalid or calendar-impossible date is accepted.
-- `useAnalyticsExport` sends a request for an empty transaction set.
-- An export failure does not surface a non-null `errorMessage`.
-
-### Production vs demo/mock split
-
-`validateDateRange` is a pure function with no backend dependency. The
-`useAnalyticsExport` hook calls the real metrics API in production; in demo
-mode it short-circuits to a local fixture and never hits the network. The
-validation runs in both modes so the guard cannot be bypassed by toggling
-demo mode.
-
----
-
-## #757 Wallet address validation — checksum & network guard
-
-**File:** `src/lib/walletAddressValidation.ts`  
-**Hook:** `src/hooks/useWalletAddressValidation.ts`  
-**Tests:** `src/lib/__tests__/walletAddressValidation.test.ts`
-
-### Failure mode
-
-A wallet address that is syntactically valid but belongs to the wrong
-network (e.g. a Stellar mainnet `G...` address pasted into a testnet flow)
-or that fails the StrKey checksum would be accepted by a naive
-length/prefix check. Sending funds to such an address is unrecoverable.
-
-### What the implementation does
-
-`validateWalletAddress` performs, in order:
-
-1. **Format check** — `G` prefix, 56 characters, base32 alphabet.
-2. **StrKey checksum** — decodes the base32 payload and verifies the
-   CRC16-XModem checksum. A single transposed character fails here.
-3. **Network check** — the address is validated against the active network
-   from `NetworkContext`; a mainnet address in a testnet session (or vice
-   versa) is rejected with `WALLET_ADDRESS_WRONG_NETWORK`.
-
-All failures return a stable error code (`WALLET_ADDRESS_INVALID_FORMAT`,
-`WALLET_ADDRESS_BAD_CHECKSUM`, `WALLET_ADDRESS_WRONG_NETWORK`) so callers
-can branch on the code rather than parsing a message string.
-
-### Tests
-
-The test suite (`walletAddressValidation.test.ts`) fails if:
-
-- A 56-char string with a valid prefix but a broken checksum is accepted.
-- A mainnet address is accepted while the active network is testnet.
-- A testnet address is accepted while the active network is mainnet.
-- The returned error code is not one of the stable codes above.
-
-### Production vs demo/mock split
-
-`validateWalletAddress` is a pure function. The active network is injected
-by the caller (from `NetworkContext`), so the same code runs in dev and
-production with no mock path.
-
----
-
-## #758 Transaction confirmation — reorg & timeout guard
-
-**File:** `src/hooks/useTransactionConfirmation.ts`  
-**Tests:** `src/hooks/__tests__/useTransactionConfirmation.test.ts`
-
-### Failure mode
-
-A transaction that is included in a block but later reorged out would be
-reported as confirmed if the hook only checks for a single inclusion. A
-transaction that never confirms would leave the UI in a permanent
-"pending" state with no timeout, and a dependency outage (Horizon/RPC
-down) would surface as an unhandled rejection.
-
-### What the implementation does
-
-`useTransactionConfirmation`:
-
-- Polls the confirmation source until the transaction reaches the
-  configured confirmation depth (default 1 for testnet, 2 for mainnet).
-- Re-checks the transaction hash on every poll; if the transaction is no
-  longer found after having been seen, it transitions to `reorged` rather
-  than `confirmed`.
-- Enforces a `timeoutMs` (default 120s). On timeout it transitions to
-  `timedOut` and surfaces a non-null `error`.
-- Treats any RPC/Horizon error as fail-closed: the state stays `pending`
-  (never `confirmed`) and the error is surfaced.
-
-### Tests
-
-The test suite (`useTransactionConfirmation.test.ts`) fails if:
-
-- A transaction seen once is reported `confirmed` without reaching the
-  required depth.
-- A transaction that disappears after being seen is reported `confirmed`
-  instead of `reorged`.
-- The timeout does not fire, or fires without setting `error`.
-- An RPC error is swallowed and the state advances to `confirmed`.
-
-### Production vs demo/mock split
-
-The hook calls the real confirmation source in production. In demo mode it
-uses a deterministic in-memory source that never reports a reorg, so the
-reorg path is only exercised by the unit tests. The confirmation depth is
-derived from the active network in `NetworkContext`.
-
----
-
-## #759 NetworkContext scopes wallets query only
-
-**File:** `src/contexts/NetworkContext.tsx`  
-**Consumer:** `src/hooks/useWallets.ts`  
-**Tests:** `src/contexts/__tests__/NetworkContext.test.tsx`
-
-### Failure mode
-
-If the wallets query is not scoped to the active network, a session on
-testnet can read mainnet wallet data (or vice versa). This leaks
-cross-network data, lets a user act on a wallet that does not exist on the
-active chain, and makes AA/payment behavior depend on whichever network
-happened to be cached first. An unknown or unsupported network must never
-produce a wallet query at all.
-
-### What the implementation does
-
-`NetworkContext` exposes a typed, stable API:
-
-```ts
-type NetworkId = 'mainnet' | 'testnet' | 'futurenet';
-
-interface NetworkContextValue {
-  networkId: NetworkId;
-  chain: 'stellar';
-  isMainnet: boolean;
-  isTestnet: boolean;
-  /** Stable error code when the configured network is unknown/unsupported. */
-  errorCode: NetworkErrorCode | null;
-  /** Correlation id for logs/metrics; never contains secrets. */
-  correlationId: string;
-}
-```
-
-`NetworkErrorCode` is a closed union (`NETWORK_UNKNOWN`,
-`NETWORK_UNSUPPORTED`, `NETWORK_MISCONFIGURED`) so callers branch on the
-code, not on a message string.
-
-**Scoping invariant.** The wallets query key includes `networkId`, and the
-query is disabled unless the context reports a supported network:
-
-```ts
-const { networkId, errorCode } = useNetwork();
-
-useQuery({
-  queryKey: ['wallets', networkId],
-  queryFn: () => fetchWallets(networkId),
-  enabled: errorCode === null, // fail-closed on unknown network
-});
-```
-
-Because `networkId` is part of the query key, switching networks cannot
-serve a cached result from the previous network. When `errorCode` is
-non-null the query never runs, so no wallet data is fetched against an
-unknown/unsupported network.
-
-**Fail-closed on dependency outage.** If the network cannot be resolved
-(e.g. the config/RPC lookup fails), `NetworkContext` sets `errorCode`
-rather than defaulting to mainnet. The wallets query stays disabled and the
-UI shows an actionable error instead of querying the wrong chain.
-
-### Tests
-
-The test suite (`NetworkContext.test.tsx`) fails if:
-
-- The wallets query key does not include `networkId`.
-- The wallets query runs while `errorCode` is non-null (unknown network).
-- Switching from testnet to mainnet serves a cached testnet result.
-- An unknown/unsupported network defaults to mainnet instead of failing
-  closed.
-- `errorCode` is not one of the stable `NetworkErrorCode` values.
-- `correlationId` is empty or contains raw key material.
-
-### Production vs demo/mock split
-
-`NetworkContext` reads the active network from the build-time env
-(`VITE_NETWORK`) and the runtime config. In demo mode it pins to `testnet`
-and never queries mainnet. The scoping invariant is enforced in both modes
-so demo mode cannot be used to bypass the network guard.
-
----
-
-## API key usage analytics charts
-
-The dashboard exposes per-API-key usage analytics charts. These charts are
-backed by a typed analytics endpoint that returns a per-key usage time-series.
-
-### Authz (deny-by-default)
-
-- The analytics endpoint is a privileged read surface and is **deny-by-default**.
-- Access is granted only to the key owner, or to a caller presenting a valid
-  API key / JWT with the required role (owner/delegate/guardian).
-- Revoked delegates and expired credentials are rejected; clients cannot bypass
-  policy by supplying a key id they do not own.
-- Authorization is evaluated server-side. The client never decides whether a
-  chart may be rendered.
-
-### Error contract
-
-- Responses use stable error codes and a correlation id so failures are
-  actionable and traceable in logs.
-- Analytics reads surface actionable errors on dependency outage (RPC/DB/Horizon)
-  rather than rendering empty or misleading charts.
-- Write paths remain fail-closed on dependency outage; analytics is read-only and
-  must never mutate key state.
-
-### Observability
-
-- Metrics/logs for the analytics path must not leak secrets or raw key material.
-- API keys, JWTs, and webhook secrets are redacted in logs.
-
-### Rollback / flags
-
-- Any money-path or mainnet-affecting change must be feature-flagged or behind a
-  kill-switch, with rollback documented in the PR description.
-- Analytics charts are read-only and do not affect spends, recovery, or admin
-  actions; the server/contract remains the source of truth.
-
-## References
-
-- `README.md`
-- `tests/e2e/`
+2. `useCommandShortcut` / 
