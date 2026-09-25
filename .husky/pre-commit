@@ -1,4 +1,11 @@
-# Pre-commit hook.
+#!/usr/bin/env sh
+# Husky pre-commit hook.
+#
+# Fail-safe for CI and fresh clones: when husky is not installed (e.g. CI
+# checkouts, tarball installs, or clones where `npm install` has not run),
+# the generated husky shim is absent. In that case we skip local enforcement
+# instead of failing the commit/CI. Contributors with husky installed still
+# get the full pre-commit checks below.
 #
 # Optional commit-message file: `.git_msg`
 #   `.git_msg` is NOT required for this hook to run. It is an optional,
@@ -11,4 +18,17 @@
 # If `.git_msg` is absent, the hook still runs normally and git will prompt
 # for a commit message as usual.
 
+# Resolve the repo root so this works regardless of the current directory.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# If husky's generated shim is missing, husky is not installed here.
+# Skip silently (fail-safe) rather than erroring out.
+if [ ! -f "$ROOT/.husky/_/husky.sh" ]; then
+  exit 0
+fi
+
+# shellcheck disable=SC1091
+. "$ROOT/.husky/_/husky.sh"
+
+# Local pre-commit enforcement for contributors who have husky installed.
 npm run lint:fix
