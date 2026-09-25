@@ -1,8 +1,102 @@
-# Security & UX Guards — Issues #701–704, #757, #758, #759
+# Security & UX Guards — Issues #701–704, #757, #758, #759, #834
 
 This document covers security and UX correctness fixes shipped together.
 Each section describes the failure mode, what was fixed, and what the
 automated tests verify.
+
+---
+
+## #834 Archive restore confirmations
+
+**Scope:** archive restore confirmation flow in `mux-frontend`  
+**Related:** `README.md`, `docs/security-ux-guards.md`, `tests/e2e/`
+
+### Failure mode
+
+Restoring an archived account/wallet is a privileged, money-path action:
+it can re-enable spends, recovery, and admin surfaces that were previously
+frozen. If restore confirmations are not authorized, not idempotent, or not
+fail-closed, an attacker (or a replayed/duplicated request) can resurrect an
+archived account, double-apply a restore, or complete a restore against a
+stale/outage backend and assume success. This is an account-takeover and
+availability gap, so the invariants below are **requirements**, not
+suggestions.
+
+### Restore confirmation invariants
+
+- **Server is the source of truth.** The frontend never marks an archive as
+  restored locally; it only reflects the server's confirmed state after a
+  successful, authorized confirmation round-trip.
+- **Deny-by-default authz.** A restore confirmation is only accepted when the
+  caller is the **owner**, an **explicitly delegated** delegate, or a
+  **guardian** acting under policy. API-key/JWT callers must carry a scope
+  that permits archive restore; a missing/expired/revoked credential fails
+  closed. There is no anonymous or implicit-owner path.
+- **Idempotency.** Every restore confirmation carries a client-generated
+  idempotency key (correlation id). Concurrent or replayed confirmations with
+  the same key resolve to the same result and never double-apply a restore.
+- **Fail-closed on dependency outage.** If the RPC/DB/Horizon dependency is
+  unavailable, the confirmation write fails closed and the UI shows a
+  retryable error — it never optimistically assumes the restore succeeded.
+- **No secrets in logs.** Confirmation logs/metrics carry the correlation id
+  and stable error code only; cookie values, JWTs, API keys, and key material
+  are redacted.
+
+### Typed entrypoint & stable error codes
+
+Restore confirmations go through a typed entrypoint that returns a stable
+`code` and a `correlationId` on every outcome:
+
+| Condition | Code |
+|---|---|
+| Caller not owner/delegate/guardian/authorized API key | `RESTORE_UNAUTHORIZED` |
+| Credential expired or delegate revoked | `RESTORE_CREDENTIAL_REVOKED` |
+| Missing/blank idempotency key | `RESTORE_MISSING_IDEMPOTENCY_KEY` |
+| Replayed confirmation (same key, already applied) | `RESTORE_ALREADY_APPLIED` |
+| Archive not found / not in restorable state | `RESTORE_NOT_RESTORABLE` |
+| RPC/DB/Horizon outage on write | `RESTORE_DEPENDENCY_UNAVAILABLE` |
+
+```ts
+// server-only: route handler / server action / server utility
+const result = await confirmArchiveRestore({
+  archiveId,
+  idempotencyKey, // client-generated correlation id
+});
+// result: { ok: true, correlationId } | { ok: false, code, correlationId }
+```
+
+### Fail-closed behavior
+
+- **Unauthorized / wrong role / revoked delegate** → reject before any write;
+  surface `RESTORE_UNAUTHORIZED` / `RESTORE_CREDENTIAL_REVOKED`.
+- **Missing idempotency key** → abort client-side before the request leaves
+  the client.
+- **Replayed confirmation** → return the original result
+  (`RESTORE_ALREADY_APPLIED`), never a second restore.
+- **Dependency outage (RPC/DB/Horizon)** → write fails closed; UI shows a
+  retryable error rather than assuming success.
+- **Testnet vs mainnet misconfig** → reject; a restore confirmation must not
+  cross networks.
+
+Errors use stable codes and correlation ids, and never log cookie values,
+JWTs, API keys, or key material.
+
+### Tests
+
+The e2e suite (`tests/e2e/`) covers the critical path:
+
+- Owner/delegate/guardian confirmation succeeds; anonymous and wrong-role
+  callers are rejected.
+- A replayed confirmation with the same idempotency key does not double-apply.
+- A confirmation without an idempotency key is rejected client-side.
+- A dependency outage fails the write closed and surfaces a retryable error.
+
+### Production vs demo/mock split
+
+Authz, idempotency, and fail-closed behavior are enforced identically in dev
+and production. There is no mock path that bypasses the restore-confirmation
+invariants, and any money-path/mainnet-affecting change lands behind a
+feature flag with a documented rollback.
 
 ---
 
@@ -188,132 +282,6 @@ The test suite (`envValidation.test.ts`) fails if:
 
 ### Production vs demo/mock split
 
-Mock data paths are only reachable when `NODE_ENV !== 'production'` **and**
-the mock flag is explicitly set. Production validation rejects both, so the
-mock path is unreachable in production.
-
----
-
-## #701 Balance visibility toggle — DOM leak guard
-
-**File:** `src/hooks/useBalanceVisibility.ts`  
-**Component:** `src/components/wallet/WalletBalance.tsx`  
-**Tests:** `src/hooks/__tests__/useBalanceVisibility.dom-leak.test.ts`
-
-### Failure mode
-
-A balance visibility toggle that renders the real formatted amount in DOM
-text (even behind CSS `display:none` or `opacity:0`) leaks the amount to:
-
-- Screen readers via the accessibility tree
-- Browser extensions (password managers, page scrapers) that read DOM text
-- The Clipboard API if a copy handler does not check the visibility state
-  before writing to the clipboard
-
-### What the implementation does
-
-`useBalanceVisibility` exposes an `isInitialized` flag. Consumers **must**
-gate their amount render on this flag to avoid a flash of the real value
-before the persisted preference is read from `localStorage`:
-
-```tsx
-if (isLoading || !isInitialized) {
-  // render a loading skeleton — not the real amount
-  return <LoadingSkeleton />;
-}
-```
-
-`WalletBalance` renders `••••••` (not the formatted amount) in the
-`data-testid="balance-display"` span when `isVisible` is false, so the
-real amount is never present in the DOM text when hidden.
-
-**Clipboard contract.** Copy handlers must check `isVisible` before writing
-the amount to the clipboard:
-
-```ts
-if (isVisible) {
-  copyToClipboard(formattedBalance);
-}
-```
-
-### Tests
-
-The test suite (`useBalanceVisibility.dom-leak.test.ts`) fails if:
-
-- `isInitialized` is removed (pre-hydration exposure).
-- The toggle returns the wrong value after an even number of flips.
-- `localStorage` and in-memory state diverge.
-- A caller ignores `isVisible` and copies the amount while hidden.
-- `localStorage` errors unexpectedly flip the balance to visible.
-
-### Production vs demo/mock split
-
-`useBalanceVisibility` is purely client-side state — no backend call
-involved. The `localStorage` key is `mux_balance_visibility`. There is no
-mock mode for this hook; it behaves identically in dev and production.
-
----
-
-## #702 Copy-to-clipboard — no silent failure
-
-**File:** `src/utils/copyToClipboardUx.ts`  
-**Hook:** `src/hooks/useCopyToClipboardUx.ts`  
-**Tests:** `src/hooks/__tests__/useCopyToClipboardUx.test.ts`
-
-### Failure mode
-
-If the Clipboard API throws (e.g. `NotAllowedError` when the user has
-denied clipboard permission, or when `navigator.clipboard` is absent in an
-embedded WebView), a silent failure means:
-
-- The user believes the wallet address was copied but it was not.
-- Sending funds to a manually-typed address increases the error rate.
-
-### What the implementation does
-
-`useCopyToClipboardUx` catches all Clipboard errors and sets a non-null,
-non-empty `error` string. The `copy()` function returns `false` on failure.
-Callers (e.g. `CopyButton`) use the `error` field to show a visible toast:
-
-```tsx
-const { copy, error, copied } = useCopyToClipboardUx();
-
-// in JSX:
-{error && <Toast variant="error">{error}</Toast>}
-{copied && <Toast variant="success">Copied!</Toast>}
-```
-
-`copyToClipboardWithFallback` tries the modern `navigator.clipboard.writeText`
-API first and falls back to `document.execCommand('copy')` for older
-browsers. Both paths throw on failure so `useCopyToClipboardUx` always
-surfaces the error.
-
-### Tests
-
-The test suite (`useCopyToClipboardUx.test.ts`) fails if:
-
-- The `catch` block sets `error` to `null` or `""` on a Clipboard failure.
-- `copied` is set to `true` after a failed write.
-- The error is swallowed silently.
-- `reset()` does not clear the error state.
-
-### Production vs demo/mock split
-
-No mock path exists for clipboard operations. The same code runs in dev and
-production. `copyToClipboardWithFallback` never calls a backend route.
-
----
-
-## #703 Keyboard commands — command palette conflict guard
-
-**File:** `src/utils/keyboardCommands.ts`  
-**Hook:** `src/hooks/useCommandPalette.ts`  
-**Tests:** `src/hooks/__tests__/useCommandPalette.test.ts`
-
-### Failure mode
-
-Two independent keyboard handler systems exist:
-
-1. `useCommandPalette` — opens the palette on `Ctrl+K` / `Cmd+K` and
-   handles `Escape`, `ArrowUp/Down`, `Enter` while open.
-2. `useCommandShortcut` / 
+Mock data paths are only enabled outside production and are rejected by
+`validateEnv` in production, so a misconfigured production build fails
+closed instead of serving fabricated wallet/AA/payment data.
