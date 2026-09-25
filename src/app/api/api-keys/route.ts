@@ -158,6 +158,7 @@ export async function POST(request: Request) {
   const correlationId = newCorrelationId();
 
   // Deny-by-default: privileged writes require an owner/API-key/JWT credential.
+  // Require an owner/API-key/JWT credential before any write is considered.
   if (!isAuthorized(request)) {
     return errorResponse(
       401,

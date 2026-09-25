@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
+import { NextRequest, NextResponse } from 'next/server';
 
 /**
  * Wallet project-settings safe update endpoint.
@@ -99,6 +100,12 @@ function errorResponse(
   );
 }
 
+function correlationIdFrom(req: NextRequest): string {
+  const incoming = req.headers.get('x-correlation-id');
+  if (incoming && /^[A-Za-z0-9._-]{1,128}$/.test(incoming)) return incoming;
+  return crypto.randomUUID();
+}
+
 /**
  * Resolve the caller identity and role. Deny-by-default: any missing or
  * unrecognized credential yields no auth context.
@@ -153,28 +160,140 @@ function fingerprint(walletId: string, update: WalletSettingsUpdate): string {
   return JSON.stringify({ walletId, update });
 }
 
+/**
+ * Fetch a page of activity. Must fail-closed: on dependency outage throw so the
+ * caller returns a typed error rather than an empty (misleading) page.
+ */
+async function fetchActivityPage(
+  _walletId: string,
+  _cursor: string | undefined,
+  _limit: number,
+): Promise<ActivityPage> {
+  // Placeholder: real implementation queries the activity store with the cursor.
+  return { items: [], nextCursor: null, hasMore: false };
+}
+
+/**
+ * Provision the first key + wallet for the given wallet id. Must be idempotent
+ * on `idempotencyKey` and fail-closed: on dependency outage throw so the caller
+ * returns a typed error rather than a partial success.
+ */
+async function onboardFirstKey(
+  _walletId: string,
+  _idempotencyKey: string,
+  _label: string | undefined,
+): Promise<OnboardResult> {
+  // Placeholder: real implementation provisions the first key + invisible
+  // wallet via the wallet service, keyed by idempotencyKey for replay safety.
+  throw new Error('wallet service not configured');
+}
+
 export async function GET(
   req: NextRequest,
   { params }: { params: { id: string } },
 ) {
-  const correlationId = req.headers.get('x-correlation-id') ?? randomUUID();
-  const auth = resolveAuth(req);
-  if (!auth) {
-    return errorResponse(401, WalletSettingsErrorCode.UNAUTHORIZED, correlationId, 'Authentication required.');
+  const correlationId = correlationIdFrom(req);
+  const walletId = params.id;
+
+  if (!walletId || !/^[A-Za-z0-9_-]{1,128}$/.test(walletId)) {
+    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid wallet id', correlationId);
+  }
+
+  const parsed = querySchema.safeParse({
+    cursor: req.nextUrl.searchParams.get('cursor') ?? undefined,
+    limit: req.nextUrl.searchParams.get('limit') ?? undefined,
+  });
+
+  if (!parsed.success) {
+    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid pagination parameters', correlationId);
+  }
+
+  const limit = parsed.data.limit ?? DEFAULT_LIMIT;
+
+  let role: 'owner' | 'delegate' | 'guardian' | null;
+  try {
+    role = await resolveRole(req, walletId);
+  } catch {
+    return errorResponse(503, ErrorCode.DEPENDENCY_UNAVAILABLE, 'Auth service unavailable', correlationId);
+  }
+
+  if (!role) {
+    return errorResponse(403, ErrorCode.FORBIDDEN, 'Not authorized for this wallet', correlationId);
   }
 
   try {
-    const record = await settingsStore.get(params.id);
-    if (!record) {
-      return errorResponse(404, WalletSettingsErrorCode.NOT_FOUND, correlationId, 'Wallet not found.');
-    }
-    return NextResponse.json({ data: record }, { headers: { 'x-correlation-id': correlationId } });
+    const page = await fetchActivityPage(walletId, parsed.data.cursor, limit);
+    return NextResponse.json(page, { headers: { 'x-correlation-id': correlationId } });
   } catch {
+    // Fail-closed: never return a partial/empty page on dependency outage.
+    return errorResponse(503, ErrorCode.DEPENDENCY_UNAVAILABLE, 'Activity store unavailable', correlationId);
+  }
+}
+
+/**
+ * Onboarding: first key + wallet.
+ *
+ * Deny-by-default authz (owner only for provisioning), idempotent on the
+ * `Idempotency-Key` header, and fail-closed on dependency outage.
+ */
+export async function POST(
+  req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const correlationId = correlationIdFrom(req);
+  const walletId = params.id;
+
+  if (!walletId || !/^[A-Za-z0-9_-]{1,128}$/.test(walletId)) {
+    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid wallet id', correlationId);
+  }
+
+  const idempotencyKey = req.headers.get('idempotency-key');
+  if (!idempotencyKey || !IDEMPOTENCY_KEY_RE.test(idempotencyKey)) {
+    return errorResponse(
+      400,
+      ErrorCode.INVALID_INPUT,
+      'Missing or invalid Idempotency-Key header',
+      correlationId,
+    );
+  }
+
+  let body: unknown = {};
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+
+  const parsed = onboardSchema.safeParse(body);
+  if (!parsed.success) {
+    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid onboarding payload', correlationId);
+  }
+
+  let role: 'owner' | 'delegate' | 'guardian' | null;
+  try {
+    role = await resolveRole(req, walletId);
+  } catch {
+    return errorResponse(503, ErrorCode.DEPENDENCY_UNAVAILABLE, 'Auth service unavailable', correlationId);
+  }
+
+  // Deny-by-default: only the owner may provision the first key + wallet.
+  if (role !== 'owner') {
+    return errorResponse(403, ErrorCode.FORBIDDEN, 'Not authorized to onboard this wallet', correlationId);
+  }
+
+  try {
+    const result = await onboardFirstKey(walletId, idempotencyKey, parsed.data.label);
+    return NextResponse.json(result, {
+      status: 201,
+      headers: { 'x-correlation-id': correlationId },
+    });
+  } catch {
+    // Fail-closed: never report success on a dependency outage for a write path.
     return errorResponse(
       503,
-      WalletSettingsErrorCode.DEPENDENCY_UNAVAILABLE,
+      ErrorCode.DEPENDENCY_UNAVAILABLE,
+      'Wallet service unavailable',
       correlationId,
-      'Settings store unavailable.',
     );
   }
 }
@@ -257,6 +376,36 @@ export async function PATCH(
       WalletSettingsErrorCode.DEPENDENCY_UNAVAILABLE,
       correlationId,
       'Settings store unavailable; update not applied.',
+    );
+  }
+}
+
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  const correlationId = req.headers.get('x-correlation-id') ?? randomUUID();
+  const auth = resolveAuth(req);
+  if (!auth) {
+    return errorResponse(401, WalletSettingsErrorCode.UNAUTHORIZED, correlationId, 'Authentication required.');
+  }
+
+  try {
+    const record = await settingsStore.get(params.id);
+    if (!record) {
+      return errorResponse(404, WalletSettingsErrorCode.NOT_FOUND, correlationId, 'Wallet not found.');
+    }
+    return NextResponse.json({ data: record }, { headers: { 'x-correlation-id': correlationId } });
+  } catch {
+    return errorResponse(
+      503,
+      WalletSettingsErrorCode.DEPENDENCY_UNAVAILABLE,
+      correlationId,
+      'Settings store unavailable.',
+    );
+  }
+}
+
     );
   }
 }
