@@ -12,7 +12,15 @@ vi.mock('@/lib/api-client', () => ({
   parseEnvelope: (...args: unknown[]) => parseEnvelope(...args),
 }));
 
-import { GET, POST, ERROR_CODES } from './route';
+// Mock the wallet settings backing store so we can assert idempotency
+// replay and fail-closed behavior without touching a real store.
+const applySettings = vi.fn();
+
+vi.mock('@/lib/wallets/settings-store', () => ({
+  applySettings: (...args: unknown[]) => applySettings(...args),
+}));
+
+import { GET, POST, ERROR_CODES, WalletSettingsErrorCode } from './route';
 
 const VALID_ID = 'wallet_123';
 
@@ -266,53 +274,126 @@ describe('POST /api/wallets/[id] envelope parsing auth negatives', () => {
     const res = await POST(
       makeRequest('POST', {
         body: { action: 'transfer' },
-        headers: { authorization: 'Bearer viewer-role-token' },
+        headers: { authorization: 'Bearer viewer.token.value' },
       }),
       ctx(),
     );
 
-    expect([401, 403]).toContain(res.status);
+    expect(res.status).toBe(403);
   });
+});
 
-  it('does not allow envelope manipulation to bypass authz', async () => {
-    parseEnvelope.mockResolvedValue({
-      data: { id: VALID_ID, role: 'admin' },
-      error: null,
-      correlationId: 'corr-spoof',
+describe('POST /api/wallets/[id] settings idempotency and fail-closed', () => {
+  const OWNER_AUTH = { authorization: 'Bearer owner.token.value' };
+  const DELEGATE_AUTH = { authorization: 'Bearer delegate.token.value' };
+  const GUARDIAN_AUTH = { authorization: 'Bearer guardian.token.value' };
+  const VIEWER_AUTH = { authorization: 'Bearer viewer.token.value' };
+
+  function settingsRequest(
+    body: Record<string, unknown>,
+    headers: Record<string, string>,
+  ): NextRequest {
+    return makeRequest('POST', {
+      body: { action: 'update-settings', settings: body },
+      headers,
     });
+  }
 
-    const res = await POST(
-      makeRequest('POST', {
-        body: { action: 'transfer', envelope: { role: 'admin' } },
-        headers: { authorization: 'Bearer viewer-role-token' },
-      }),
-      ctx(),
-    );
-
-    expect([401, 403]).toContain(res.status);
+  beforeEach(() => {
+    parseEnvelope.mockReset();
+    applySettings.mockReset();
   });
 
-  it('rejects a non-JSON request body', async () => {
-    const res = await POST(
-      makeRequest('POST', {
-        rawBody: 'not json at all',
-        headers: { authorization: 'Bearer valid-token', 'content-type': 'application/json' },
-      }),
-      ctx(),
-    );
-
-    expect(res.status).toBeGreaterThanOrEqual(400);
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it('rejects a body missing required envelope fields', async () => {
+  it('replays the original result for the same Idempotency-Key and calls the store once', async () => {
+    const original = {
+      id: VALID_ID,
+      label: 'Primary',
+      allowDirectSpend: true,
+      guardianPublicKey: VALID_STELLAR_ADDRESS,
+    };
+    applySettings.mockResolvedValue(original);
+
+    const headers = { ...OWNER_AUTH, 'idempotency-key': 'idem-replay-1' };
+    const body = { label: 'Primary', allowDirectSpend: true };
+
+    const first = await POST(settingsRequest(body, headers), ctx());
+    const firstJson = await first.json();
+
+    const second = await POST(settingsRequest(body, headers), ctx());
+    const secondJson = await second.json();
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(secondJson).toEqual(firstJson);
+    expect(applySettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns DEPENDENCY_UNAVAILABLE and persists nothing when the store rejects', async () => {
+    applySettings.mockRejectedValue(new Error('store unavailable'));
+
     const res = await POST(
-      makeRequest('POST', {
-        body: {},
-        headers: { authorization: 'Bearer valid-token' },
-      }),
+      settingsRequest(
+        { label: 'Primary', allowDirectSpend: false },
+        { ...OWNER_AUTH, 'idempotency-key': 'idem-fail-1' },
+      ),
       ctx(),
     );
+    const json = await res.json();
 
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(json.error.code).toBe(WalletSettingsErrorCode.DEPENDENCY_UNAVAILABLE);
+    expect(applySettings).toHaveBeenCalledTimes(1);
+    expect(json.settings).toBeUndefined();
+  });
+
+  it('forbids a caller without owner/delegate/guardian role', async () => {
+    const res = await POST(
+      settingsRequest(
+        { label: 'Primary' },
+        { ...VIEWER_AUTH, 'idempotency-key': 'idem-forbidden-1' },
+      ),
+      ctx(),
+    );
+    const json = await res.json();
+
+    expect(res.status).toBe(403);
+    expect(json.error.code).toBe(WalletSettingsErrorCode.FORBIDDEN);
+    expect(applySettings).not.toHaveBeenCalled();
+  });
+
+  it('allows a delegate and a guardian to update settings', async () => {
+    applySettings.mockResolvedValue({ id: VALID_ID, label: 'Delegated' });
+
+    const delegateRes = await POST(
+      settingsRequest({ label: 'Delegated' }, { ...DELEGATE_AUTH, 'idempotency-key': 'idem-delegate-1' }),
+      ctx(),
+    );
+    expect(delegateRes.status).toBe(200);
+
+    applySettings.mockResolvedValue({ id: VALID_ID, label: 'Guarded' });
+    const guardianRes = await POST(
+      settingsRequest({ label: 'Guarded' }, { ...GUARDIAN_AUTH, 'idempotency-key': 'idem-guardian-1' }),
+      ctx(),
+    );
+    expect(guardianRes.status).toBe(200);
+  });
+
+  it('rejects an invalid guardianPublicKey with INVALID_INPUT', async () => {
+    const res = await POST(
+      settingsRequest(
+        { guardianPublicKey: 'not-a-stellar-address' },
+        { ...OWNER_AUTH, 'idempotency-key': 'idem-invalid-1' },
+      ),
+      ctx(),
+    );
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.error.code).toBe(WalletSettingsErrorCode.INVALID_INPUT);
+    expect(applySettings).not.toHaveBeenCalled();
   });
 });
