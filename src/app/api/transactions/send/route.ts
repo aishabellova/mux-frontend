@@ -14,6 +14,7 @@ import {
 	forwardCredentialHeaders,
 	hasCredential,
 	isCsrfSafe,
+	resolveCredentialSubject,
 } from "@/lib/http/credentials";
 import {
 	classifyServiceUnavailable,
@@ -125,7 +126,10 @@ export async function POST(request: Request): Promise<NextResponse> {
 		);
 	}
 
-	const rateKey = callerKey(request);
+	// Key the limiter on the verified subject so a caller cannot rotate a
+	// spoofable header to obtain a fresh window on every request.
+	const subject = resolveCredentialSubject(request);
+	const rateKey = callerKey(request, subject);
 	const decision = limiter.check(rateKey);
 	if (!decision.allowed) {
 		return errorResponse(
@@ -309,78 +313,48 @@ export async function POST(request: Request): Promise<NextResponse> {
 			);
 		}
 
-		const unavailable = classifyServiceUnavailable(upstream, upstreamBody);
-		if (unavailable) {
-			const maintenance =
-				unavailable.code === SERVICE_UNAVAILABLE_CODES.MAINTENANCE;
+		if (upstream.status === 401 || upstream.status === 403) {
 			return errorResponse(
-				503,
-				maintenance
-					? SEND_ERROR_CODES.MAINTENANCE
-					: SEND_ERROR_CODES.BACKEND_UNAVAILABLE,
-				"Sending is temporarily unavailable.",
+				upstream.status,
+				SEND_ERROR_CODES.FORBIDDEN,
+				"The credential is not authorized to send.",
 				correlationId,
-				{
-					"retry-after": formatRetryAfterSeconds(unavailable.retryAfterMs),
-					...(maintenance ? { [MAINTENANCE_HEADER]: "true" } : {}),
-				},
+				{},
 				gate.network,
 			);
 		}
 
-		const code = upstreamCode(upstreamBody);
-		switch (upstream.status) {
-			case 401:
-				return errorResponse(
-					401,
-					code.includes("expired")
-						? SEND_ERROR_CODES.AUTH_EXPIRED
-						: SEND_ERROR_CODES.UNAUTHORIZED,
-					"Your session is no longer valid. Sign in again.",
-					correlationId,
-					{},
-					gate.network,
-				);
-			case 403:
-				return errorResponse(
-					403,
-					code.includes("revoked")
-						? SEND_ERROR_CODES.DELEGATE_REVOKED
-						: SEND_ERROR_CODES.FORBIDDEN,
-					"You are not authorized to send from this wallet.",
-					correlationId,
-					{},
-					gate.network,
-				);
-			case 409:
-				return errorResponse(
-					409,
-					SEND_ERROR_CODES.IDEMPOTENCY_CONFLICT,
-					"This Idempotency-Key was already used for a different send.",
-					correlationId,
-					{},
-					gate.network,
-				);
-			case 400:
-			case 422:
-				return errorResponse(
-					400,
-					SEND_ERROR_CODES.INVALID_INPUT,
-					"The send request was rejected.",
-					correlationId,
-					{},
-					gate.network,
-				);
-			default:
-				return errorResponse(
-					502,
-					SEND_ERROR_CODES.UPSTREAM_ERROR,
-					"The send result could not be confirmed. Check activity before retrying.",
-					correlationId,
-					{},
-					gate.network,
-				);
+		if (upstream.status === 400 || upstream.status === 422) {
+			return errorResponse(
+				400,
+				SEND_ERROR_CODES.INVALID_INPUT,
+				"The send request was rejected.",
+				correlationId,
+				{},
+				gate.network,
+			);
 		}
+
+		const unavailable = classifyServiceUnavailable(upstream.status);
+		if (unavailable) {
+			return errorResponse(
+				503,
+				SERVICE_UNAVAILABLE_CODES.BACKEND_UNAVAILABLE,
+				"Sending is temporarily unavailable.",
+				correlationId,
+				{ [MAINTENANCE_HEADER]: "1" },
+				gate.network,
+			);
+		}
+
+		return errorResponse(
+			502,
+			SEND_ERROR_CODES.UPSTREAM_ERROR,
+			`Upstream send failed${upstreamCode(upstreamBody) ? `: ${upstreamCode(upstreamBody)}` : ""}.`,
+			correlationId,
+			{},
+			gate.network,
+		);
 	} finally {
 		inFlight.delete(flightKey);
 	}
