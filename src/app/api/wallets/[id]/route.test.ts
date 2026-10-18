@@ -12,9 +12,12 @@ vi.mock('@/lib/api-client', () => ({
   parseEnvelope: (...args: unknown[]) => parseEnvelope(...args),
 }));
 
-import { GET, POST } from './route';
+import { GET, POST, ERROR_CODES } from './route';
 
 const VALID_ID = 'wallet_123';
+
+// A syntactically valid Stellar account address (G + 55 base32 chars).
+const VALID_STELLAR_ADDRESS = 'G' + 'A'.repeat(55);
 
 function makeRequest(
   method: 'GET' | 'POST',
@@ -145,6 +148,77 @@ describe('GET /api/wallets/[id] envelope parsing', () => {
 
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(parseEnvelope).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/wallets/[id] receive payload', () => {
+  beforeEach(() => {
+    parseEnvelope.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns a web+stellar:pay URI and a badge matching the wallet network', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: { id: VALID_ID, network: 'testnet', address: VALID_STELLAR_ADDRESS },
+      error: null,
+      correlationId: 'corr-recv',
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.uri.startsWith('web+stellar:pay')).toBe(true);
+    expect(json.network.network).toBe('testnet');
+    expect(json.network.isMainnet).toBe(false);
+  });
+
+  it('marks a mainnet wallet badge as mainnet', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: { id: VALID_ID, network: 'mainnet', address: VALID_STELLAR_ADDRESS },
+      error: null,
+      correlationId: 'corr-recv-main',
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json.network.network).toBe('mainnet');
+    expect(json.network.isMainnet).toBe(true);
+  });
+
+  it('rejects an address that fails STELLAR_ADDRESS_RE', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: { id: VALID_ID, network: 'testnet', address: 'not-a-stellar-address' },
+      error: null,
+      correlationId: 'corr-recv-bad',
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(json.error.code).toBe(ERROR_CODES.INVALID_RECEIVE_ADDRESS);
+  });
+
+  it('fails closed on a network mismatch instead of defaulting to mainnet', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: { id: VALID_ID, network: 'testnet', address: VALID_STELLAR_ADDRESS },
+      error: null,
+      correlationId: 'corr-recv-mismatch',
+      configuredNetwork: 'mainnet',
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(json.error.code).toBe(ERROR_CODES.NETWORK_MISMATCH);
+    expect(json.network).toBeUndefined();
   });
 });
 
