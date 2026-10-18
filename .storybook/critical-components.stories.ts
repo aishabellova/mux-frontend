@@ -66,3 +66,21 @@ export const PaymentComponent: Story = {
     lastModified: '2026-09-26',
   },
 };
+
+// Notifications/Empty is a money-path surface: an outage must not look like
+// 'no notifications'. Reference it here so it runs in the critical-components
+// suite alongside the other CI-critical stories.
+export const NotificationsEmptyReference: Story = {
+  name: 'Notifications/Empty (critical)',
+  parameters: {
+    docs: {
+      description: {
+        story: 'References Notifications/Empty (Empty and LoadError) in the critical-components suite.',
+      },
+    },
+  },
+  args: {
+    ...criticalComponentFixtures[0],
+    lastModified: '2026-09-26',
+  },
+};
